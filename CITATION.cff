@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software or its fault-investigation methodology, please cite it as below."
+title: "AORUS Fault Watchdog"
+type: software
+authors:
+  - family-names: "Fedchyk"
+    given-names: "Mykola"
+    email: "nick.fedchik@gmail.com"
+version: 0.1.0
+date-released: 2026-08-14
+license: MIT
+abstract: >-
+  An event-driven Linux watchdog and diagnostic capture service for a correlated
+  NVIDIA GSP runtime-power and Intel Alder Lake PCH xHCI failure sequence
+  investigated on the Gigabyte AORUS 5 SE4 laptop.

@@ -1,0 +1,27 @@
+[Unit]
+Description=AORUS NVIDIA/xHCI fault capture and recovery watchdog
+After=systemd-journald.service aorus-idle-workaround.service
+Wants=aorus-idle-workaround.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/sbin/aorus-fault-watchdog
+Restart=always
+RestartSec=2s
+WatchdogSec=45s
+NotifyAccess=main
+RuntimeDirectory=aorus-fault-watchdog
+StateDirectory=aorus-fault-watchdog
+StateDirectoryMode=0750
+UMask=0027
+RestartPreventExitStatus=78
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
