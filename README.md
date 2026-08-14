@@ -111,6 +111,11 @@ The incident that motivated the combined watchdog occurred in this order:
 Temporal correlation does not prove that NVIDIA directly causes xHCI failure;
 both failures may result from a shared platform power or firmware defect.
 
+The NVIDIA bug report collected while the GPU was degraded also preserved two
+earlier failures: `Xid 119/154` on 2026-08-13 and `Xid 79/154` on 2026-08-14.
+This supports recurrence of the NVIDIA failure class, but only the final
+`Xid 119/154` incident is currently correlated with a subsequent xHCI death.
+
 ## Technology
 
 The core daemon is written in C17 and links dynamically to `libsystemd`:
@@ -120,17 +125,23 @@ The core daemon is written in C17 and links dynamically to `libsystemd`:
 - `sd_notify` provides readiness and heartbeat notifications;
 - systemd supervises the daemon with `WatchdogSec=45s`;
 - event classification is isolated in a small, unit-tested module;
-- a root-only Bash helper collects diagnostic state only after an event.
+- a root-only Bash helper collects diagnostic state only after an event;
+- one bounded `nvidia-smi` telemetry probe at daemon startup detects a GPU that
+  already reports `GPU requires reset` before journal monitoring begins.
 
-The daemon never polls `nvidia-smi`. That command can block or return partial
-data after a GSP failure.
+The daemon does not continuously poll `nvidia-smi`. Its single startup probe is
+terminated after 10 seconds because that command can block or return partial
+data after a GSP failure. A boot-ID marker limits startup-degraded capture to
+once per boot even if systemd restarts the service.
 
 ## Events and actions
 
 | Event | Diagnostic capture | Automatic action |
 |---|---:|---|
-| NVIDIA `Xid 119` | Yes | Set GPU `power/control=on` |
-| NVIDIA `Xid 154` | Rate-limited | Set GPU `power/control=on` |
+| NVIDIA `Xid 79` | Yes | Set NVIDIA PCI functions `power/control=on` |
+| NVIDIA `Xid 119` | Yes | Set NVIDIA PCI functions `power/control=on` |
+| NVIDIA `Xid 154` | Rate-limited | Set NVIDIA PCI functions `power/control=on` |
+| Failed/timed-out startup GPU health probe | Yes | Set NVIDIA PCI functions `power/control=on` |
 | DMAR fault | Yes | None |
 | xHCI TRB/ring corruption | Yes | None |
 | Exact `00:14.0: HC died; cleaning up` | Always, before recovery | xHCI unbind/bind |
@@ -143,7 +154,8 @@ Safety boundaries:
 - xHCI rebind is limited to once per 10 minutes;
 - general captures are limited to once per 30 seconds;
 - an xHCI death within 180 seconds of an NVIDIA Xid is marked as correlated;
-- only new journal entries after daemon startup are processed.
+- only new journal entries after daemon startup are processed, supplemented by
+  the one-time startup GPU health probe.
 
 ## Diagnostic output
 
@@ -154,8 +166,9 @@ systemd creates the state directory automatically. Incidents are stored under:
 ```
 
 Each incident contains an event record and a timestamped capture with relevant
-kernel journal entries, USB topology, PCI state, runtime-power state, input
-devices, interrupts and available xHCI debugfs metadata.
+kernel journal entries, USB topology, PCI state, runtime-power state for both
+NVIDIA PCI functions, bounded `nvidia-smi` output, input devices, interrupts
+and available xHCI debugfs metadata.
 
 These files may contain hostnames, hardware identifiers and device serial
 numbers. Review them before attaching them to a public GitHub issue.
@@ -168,6 +181,7 @@ numbers. Review them before attaching them to a public GitHub issue.
 - `pkg-config`
 - `libsystemd` development headers
 - `usbutils` and `pciutils` for diagnostic captures
+- the NVIDIA driver utilities providing `/usr/bin/nvidia-smi`
 
 On Ubuntu:
 
@@ -210,7 +224,7 @@ make test
 ```
 
 The build enables `-Wall -Wextra -Wpedantic -Werror`. The tests exercise known
-NVIDIA, DMAR and xHCI messages as well as negative cases.
+NVIDIA `Xid 79/119/154`, DMAR and xHCI messages as well as negative cases.
 
 Classifier-only checks do not require root and perform no recovery action:
 
@@ -270,6 +284,7 @@ that diagnostic evidence is not deleted accidentally.
 - This service mitigates and records failures; it does not repair the underlying
   BIOS, EC, xHCI silicon, NVIDIA firmware or driver defect.
 - A recovered xHCI bus does not imply that a GPU affected by `Xid 154` is healthy.
+- The startup probe detects degraded NVIDIA state but never attempts a GPU reset.
 - A complete hardware lock may stop the journal before its final messages reach
   disk. Remote netconsole or a functioning hardware watchdog is needed for that
   failure class.

@@ -11,8 +11,10 @@ struct test_case {
 int main(void)
 {
 	static const struct test_case tests[] = {
+		{"NVRM: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus", FAULT_NVIDIA_XID_79},
 		{"NVRM: Xid (PCI:0000:01:00): 119, Timeout after 5s", FAULT_NVIDIA_XID_119},
 		{"NVRM: Xid (PCI:0000:01:00): 154, GPU recovery action changed", FAULT_NVIDIA_XID_154},
+		{"NVRM: Xid (PCI:0000:01:00): 179, unrelated Xid", FAULT_NONE},
 		{"NVRM: RPC sequence 119 is harmless here", FAULT_NONE},
 		{"xhci_hcd 0000:00:14.0: HC died; cleaning up", FAULT_XHCI_DEAD},
 		{"xhci_hcd 0000:00:0d.0: HC died; cleaning up", FAULT_NONE},
@@ -30,6 +32,21 @@ int main(void)
 			        fault_event_name(tests[index].expected), fault_event_name(actual));
 			return EXIT_FAILURE;
 		}
+	}
+
+	if (!nvidia_probe_output_healthy("GPU-02d6023c, P8, 42")) {
+		fputs("healthy NVIDIA startup probe was rejected\n", stderr);
+		return EXIT_FAILURE;
+	}
+	if (nvidia_probe_output_healthy(
+	        "GPU-02d6023c, [GPU requires reset], [GPU requires reset]")) {
+		fputs("degraded NVIDIA startup probe was accepted\n", stderr);
+		return EXIT_FAILURE;
+	}
+	if (nvidia_probe_output_healthy("") ||
+	    nvidia_probe_output_healthy("NVIDIA-SMI has failed")) {
+		fputs("invalid NVIDIA startup probe was accepted\n", stderr);
+		return EXIT_FAILURE;
 	}
 
 	puts("classification tests passed");
