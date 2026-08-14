@@ -45,6 +45,9 @@ enum fault_event classify_message(const char *message)
 	}
 
 	xid = nvidia_xid(message);
+	if (xid == 79) {
+		return FAULT_NVIDIA_XID_79;
+	}
 	if (xid == 119) {
 		return FAULT_NVIDIA_XID_119;
 	}
@@ -74,13 +77,32 @@ enum fault_event classify_message(const char *message)
 	return FAULT_NONE;
 }
 
+bool nvidia_probe_output_healthy(const char *output)
+{
+	if (output == NULL || output[0] == '\0') {
+		return false;
+	}
+	if (strstr(output, "GPU-") == NULL) {
+		return false;
+	}
+	if (strstr(output, "GPU requires reset") != NULL ||
+	    strstr(output, "ERR!") != NULL) {
+		return false;
+	}
+	return true;
+}
+
 const char *fault_event_name(enum fault_event event)
 {
 	switch (event) {
+	case FAULT_NVIDIA_XID_79:
+		return "nvidia-xid-79";
 	case FAULT_NVIDIA_XID_119:
 		return "nvidia-xid-119";
 	case FAULT_NVIDIA_XID_154:
 		return "nvidia-xid-154";
+	case FAULT_NVIDIA_STARTUP_DEGRADED:
+		return "nvidia-startup-degraded";
 	case FAULT_XHCI_DEAD:
 		return "xhci-hc-died";
 	case FAULT_DMAR:

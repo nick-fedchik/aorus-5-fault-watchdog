@@ -22,17 +22,28 @@ for item in control runtime_status runtime_suspended_time wakeup; do
   cat "${source_path}" > "${out_dir}/00:14.0-power-${item}.txt"
 done
 
-for item in control runtime_status runtime_suspended_time; do
-  source_path="/sys/bus/pci/devices/0000:01:00.0/power/${item}"
-  [[ -r "${source_path}" ]] || continue
-  cat "${source_path}" > "${out_dir}/01:00.0-power-${item}.txt"
+for pci_device in 0000:01:00.0 0000:01:00.1; do
+  for item in control runtime_status runtime_suspended_time; do
+    source_path="/sys/bus/pci/devices/${pci_device}/power/${item}"
+    [[ -r "${source_path}" ]] || continue
+    cat "${source_path}" > "${out_dir}/${pci_device#0000:}-power-${item}.txt"
+  done
 done
 
-for pci_device in 0000:00:14.0 0000:01:00.0; do
+for pci_device in 0000:00:14.0 0000:01:00.0 0000:01:00.1; do
   source_path="/sys/bus/pci/devices/${pci_device}/d3cold_allowed"
   [[ -r "${source_path}" ]] || continue
   cat "${source_path}" > "${out_dir}/${pci_device#0000:}-d3cold_allowed.txt"
 done
+
+if [[ -r /run/aorus-fault-watchdog/startup-nvidia-smi.txt ]]; then
+  cp /run/aorus-fault-watchdog/startup-nvidia-smi.txt \
+    "${out_dir}/startup-nvidia-smi.txt"
+fi
+if command -v nvidia-smi >/dev/null 2>&1; then
+  timeout --signal=TERM --kill-after=2s 10s nvidia-smi -q \
+    > "${out_dir}/nvidia-smi-q.txt" 2>&1 || true
+fi
 
 journalctl -b -k --no-pager > "${out_dir}/journalctl-k-b.txt"
 journalctl -b -k --no-pager | grep -nE \

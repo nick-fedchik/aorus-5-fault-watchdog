@@ -26,6 +26,10 @@
 #define CAPTURE_SCRIPT "/usr/local/libexec/aorus-fault-watchdog-capture"
 #define WORKAROUND_SCRIPT "/usr/local/sbin/aorus-idle-workaround"
 #define NVIDIA_POWER_CONTROL "/sys/bus/pci/devices/0000:01:00.0/power/control"
+#define NVIDIA_AUDIO_POWER_CONTROL "/sys/bus/pci/devices/0000:01:00.1/power/control"
+#define NVIDIA_SMI "/usr/bin/nvidia-smi"
+#define STARTUP_PROBE_OUTPUT "/run/aorus-fault-watchdog/startup-nvidia-smi.txt"
+#define BOOT_ID_PATH "/proc/sys/kernel/random/boot_id"
 #define XHCI_UNBIND "/sys/bus/pci/drivers/xhci_hcd/unbind"
 #define XHCI_BIND "/sys/bus/pci/drivers/xhci_hcd/bind"
 #define LOCK_FILE "/run/aorus-fault-watchdog.lock"
@@ -34,6 +38,7 @@
 #define REBIND_RATE_LIMIT_SEC 600
 #define CORRELATION_WINDOW_SEC 180
 #define CAPTURE_TIMEOUT_SEC 30
+#define NVIDIA_PROBE_TIMEOUT_SEC 10
 #define EXIT_UNSUPPORTED_PLATFORM 78
 
 #define DMI_SYS_VENDOR "/sys/class/dmi/id/sys_vendor"
@@ -172,6 +177,41 @@ static int mkdir_if_needed(const char *path, mode_t mode)
 		return 0;
 	}
 	return -errno;
+}
+
+static int claim_startup_degraded_capture(void)
+{
+	const char *state_directory = getenv("STATE_DIRECTORY");
+	char boot_id[64];
+	char marker_path[1024];
+	int fd;
+	int result;
+
+	if (state_directory == NULL || state_directory[0] != '/') {
+		state_directory = DEFAULT_STATE_DIRECTORY;
+	}
+	result = read_trimmed(BOOT_ID_PATH, boot_id, sizeof(boot_id));
+	if (result < 0) {
+		return result;
+	}
+	result = mkdir_if_needed(state_directory, 0750);
+	if (result < 0) {
+		return result;
+	}
+	result = snprintf(marker_path, sizeof(marker_path),
+	                  "%s/startup-degraded-%s.marker", state_directory, boot_id);
+	if (result < 0 || (size_t)result >= sizeof(marker_path)) {
+		return -ENAMETOOLONG;
+	}
+
+	fd = open(marker_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0640);
+	if (fd < 0) {
+		return errno == EEXIST ? 0 : -errno;
+	}
+	if (close(fd) < 0) {
+		return -errno;
+	}
+	return 1;
 }
 
 static int create_incident_dir(enum fault_event event, char *out, size_t out_size)
@@ -334,16 +374,40 @@ static void run_capture_async(const char *incident_dir)
 	log_message(LOG_INFO, "capture worker pid=%ld directory=%s", (long)pid, incident_dir);
 }
 
-static int apply_nvidia_containment(void)
+static int force_nvidia_power_on(bool after_fault)
 {
-	int result = write_value(NVIDIA_POWER_CONTROL, "on");
+	int gpu_result = write_value(NVIDIA_POWER_CONTROL, "on");
+	int audio_result = write_value(NVIDIA_AUDIO_POWER_CONTROL, "on");
 
-	if (result < 0) {
-		log_message(LOG_ERR, "cannot force NVIDIA power on: %s", strerror(-result));
-	} else {
-		log_message(LOG_WARNING, "NVIDIA runtime power forced on after fault event");
+	if (gpu_result < 0) {
+		log_message(LOG_ERR, "cannot force NVIDIA GPU function power on: %s",
+		            strerror(-gpu_result));
 	}
-	return result;
+	if (audio_result < 0 && audio_result != -ENOENT) {
+		log_message(LOG_ERR, "cannot force NVIDIA audio function power on: %s",
+		            strerror(-audio_result));
+	}
+	if (gpu_result == 0 && (audio_result == 0 || audio_result == -ENOENT)) {
+		log_message(after_fault ? LOG_WARNING : LOG_INFO,
+		            after_fault
+		                ? "NVIDIA PCI function runtime power forced on after fault event"
+		                : "NVIDIA PCI function runtime power forced on at startup");
+	}
+	if (gpu_result < 0) {
+		return gpu_result;
+	}
+	if (audio_result < 0 && audio_result != -ENOENT) {
+		return audio_result;
+	} else {
+		return 0;
+	}
+}
+
+static bool is_nvidia_event(enum fault_event event)
+{
+	return event == FAULT_NVIDIA_XID_79 || event == FAULT_NVIDIA_XID_119 ||
+	       event == FAULT_NVIDIA_XID_154 ||
+	       event == FAULT_NVIDIA_STARTUP_DEGRADED;
 }
 
 static int recover_xhci(const char *incident_dir)
@@ -381,7 +445,7 @@ static int handle_event(enum fault_event event, const char *message,
 	                    int64_t *last_nvidia_fault)
 {
 	int64_t now = monotonic_seconds();
-	bool nvidia_event = event == FAULT_NVIDIA_XID_119 || event == FAULT_NVIDIA_XID_154;
+	bool nvidia_event = is_nvidia_event(event);
 	bool correlated = false;
 	bool should_capture;
 	char incident_dir[1024];
@@ -389,7 +453,7 @@ static int handle_event(enum fault_event event, const char *message,
 
 	if (nvidia_event) {
 		*last_nvidia_fault = now;
-		(void)apply_nvidia_containment();
+		(void)force_nvidia_power_on(true);
 	}
 	if (event == FAULT_XHCI_DEAD && *last_nvidia_fault > 0 &&
 	    now - *last_nvidia_fault <= CORRELATION_WINDOW_SEC) {
@@ -435,6 +499,60 @@ static int handle_event(enum fault_event event, const char *message,
 	return recover_xhci(incident_dir);
 }
 
+static void check_nvidia_startup_health(int64_t *last_capture,
+	                                   int64_t *last_rebind,
+	                                   int64_t *last_nvidia_fault)
+{
+	char message[256];
+	char probe_output[1024];
+	char *const argv[] = {(char *)NVIDIA_SMI,
+	                      "--query-gpu=uuid,pstate,temperature.gpu",
+	                      "--format=csv,noheader", NULL};
+	int result;
+	int capture_claim;
+
+	if (access(NVIDIA_SMI, X_OK) < 0) {
+		log_message(LOG_WARNING, "startup GPU health probe skipped: %s is unavailable",
+		            NVIDIA_SMI);
+		return;
+	}
+
+	result = run_program(NVIDIA_SMI, argv, NVIDIA_PROBE_TIMEOUT_SEC,
+	                     STARTUP_PROBE_OUTPUT);
+	if (result == 0) {
+		result = read_trimmed(STARTUP_PROBE_OUTPUT, probe_output,
+		                      sizeof(probe_output));
+	}
+	if (result == 0 && nvidia_probe_output_healthy(probe_output)) {
+		log_message(LOG_INFO, "startup GPU health probe passed");
+		return;
+	}
+
+	if (result == -ETIMEDOUT) {
+		snprintf(message, sizeof(message),
+		         "startup nvidia-smi health probe timed out after %d seconds",
+		         NVIDIA_PROBE_TIMEOUT_SEC);
+	} else if (result < 0) {
+		snprintf(message, sizeof(message),
+		         "startup nvidia-smi health probe failed: %s", strerror(-result));
+	} else {
+		snprintf(message, sizeof(message),
+		         "startup nvidia-smi health probe reported degraded GPU state");
+	}
+	capture_claim = claim_startup_degraded_capture();
+	if (capture_claim == 0) {
+		log_message(LOG_WARNING,
+		            "%s; incident capture already completed during this boot", message);
+		return;
+	}
+	if (capture_claim < 0) {
+		log_message(LOG_ERR, "cannot create startup-degraded boot marker: %s",
+		            strerror(-capture_claim));
+	}
+	(void)handle_event(FAULT_NVIDIA_STARTUP_DEGRADED, message, last_capture,
+	                   last_rebind, last_nvidia_fault);
+}
+
 static int monitor_journal(void)
 {
 	sd_journal *journal = NULL;
@@ -461,8 +579,12 @@ static int monitor_journal(void)
 		return result;
 	}
 
+	(void)force_nvidia_power_on(false);
+	check_nvidia_startup_health(&last_capture, &last_rebind, &last_nvidia_fault);
+
 	sd_notify(0, "READY=1\nSTATUS=Monitoring NVIDIA/xHCI/DMAR kernel events");
-	log_message(LOG_INFO, "watchdog ready; monitoring new kernel events only");
+	log_message(LOG_INFO,
+	            "watchdog ready; startup GPU probe complete, monitoring new kernel events");
 
 	while (!stop_requested) {
 		while ((result = sd_journal_next(journal)) > 0) {
